@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>TSMC Murphy Yield Calculator</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:#0a0e1a; color:#e2e8f0; font-family:'Inter',sans-serif; }
+  input[type=range] { -webkit-appearance:auto; accent-color:#818CF8; cursor:pointer; width:100%; }
+  button { font-family:'JetBrains Mono',monospace; }
+  a { transition: color 0.15s; }
+  table { width:100%; border-collapse:collapse; }
+  ::-webkit-scrollbar { width:6px; height:6px; }
+  ::-webkit-scrollbar-track { background:rgba(255,255,255,0.02); }
+  ::-webkit-scrollbar-thumb { background:rgba(255,255,255,0.1); border-radius:3px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useMemo, useCallback } = React;
+
+// ─── TSMC Node Data ────────────────────────────────────────────
+const TSMC_NODES = {
+  "N16": { label: "N16 (16nm)", d0_mature: 0.04,  d0_ramp: 0.15, color: "#2DD4BF", year: 2015, src: "Est" },
+  "N12": { label: "N12 (12nm)", d0_mature: 0.045, d0_ramp: 0.14, color: "#34D399", year: 2016, src: "Est" },
+  "N10": { label: "N10 (10nm)", d0_mature: 0.06,  d0_ramp: 0.20, color: "#60A5FA", year: 2017, src: "Est" },
+  "N7":  { label: "N7 (7nm)",   d0_mature: 0.06,  d0_ramp: 0.33, color: "#818CF8", year: 2018, src: "★" },
+  "N7P": { label: "N7P",        d0_mature: 0.055, d0_ramp: 0.28, color: "#A78BFA", year: 2019, src: "Est" },
+  "N7+": { label: "N7+ (EUV)",  d0_mature: 0.06,  d0_ramp: 0.30, color: "#C084FC", year: 2019, src: "Est" },
+  "N6":  { label: "N6 (6nm)",   d0_mature: 0.05,  d0_ramp: 0.22, color: "#F472B6", year: 2020, src: "Est" },
+  "N5":  { label: "N5 (5nm)",   d0_mature: 0.05,  d0_ramp: 0.33, color: "#38BDF8", year: 2020, src: "★" },
+  "N4":  { label: "N4 (4nm)",   d0_mature: 0.05,  d0_ramp: 0.25, color: "#22D3EE", year: 2022, src: "Est" },
+  "N3":  { label: "N3 (3nm)",   d0_mature: 0.06,  d0_ramp: 0.35, color: "#FB923C", year: 2023, src: "★" },
+  "N3E": { label: "N3E",        d0_mature: 0.055, d0_ramp: 0.30, color: "#F97316", year: 2023, src: "Est" },
+  "N2":  { label: "N2 (2nm)",   d0_mature: 0.06,  d0_ramp: 0.30, color: "#F43F5E", year: 2025, src: "★" },
+};
+
+const MATURITY_LEVELS = {
+  "ramp":   { label: "Early Ramp", factor: 1.0 },
+  "hvm":    { label: "HVM Start",  factor: 0.60 },
+  "6mo":    { label: "+6 Months",  factor: 0.35 },
+  "12mo":   { label: "+12 Months", factor: 0.18 },
+  "mature": { label: "Mature",     factor: 0.0 },
+};
+
+// ─── Yield Models ──────────────────────────────────────────────
+function murphyYield(A, D) { const x=A*D; if(x<1e-9)return 1; return Math.pow((1-Math.exp(-x))/x,2); }
+function poissonYield(A, D) { return Math.exp(-A*D); }
+function seedsYield(A, D) { const x=A*D; if(x<1e-9)return 1; return (1-Math.exp(-x))/x; }
+function negBinYield(A, D, a=2) { return Math.pow(1+(A*D)/a,-a); }
+
+// ─── SRAM Redundancy (Bernoulli Trials) ────────────────────────
+function sramRepairYield(sA, D, nU, nS) {
+  if(nU<=0||sA<=0) return 1;
+  const uA=sA/nU, pF=1-poissonYield(uA,D);
+  let y=0; for(let k=0;k<=nS;k++) y+=binPMF(nU,k,pF);
+  return Math.min(1,y);
+}
+function binPMF(n,k,p) {
+  if(k>n||k<0)return 0;
+  return Math.exp(lnC(n,k)+k*Math.log(p+1e-30)+(n-k)*Math.log(1-p+1e-30));
+}
+function lnC(n,k) { if(k===0||k===n)return 0; let s=0; for(let i=0;i<k;i++)s+=Math.log(n-i)-Math.log(i+1); return s; }
+
+// ─── Wafer Geometry ────────────────────────────────────────────
+function computeDies(wD, dW, dH, eE=3, sc=0.1) {
+  const R=wD/2-eE, pX=dW+sc, pY=dH+sc, dies=[], nx=Math.ceil(wD/pX), ny=Math.ceil(wD/pY);
+  for(let ix=-nx;ix<=nx;ix++) for(let iy=-ny;iy<=ny;iy++) {
+    const cx=ix*pX, cy=iy*pY;
+    const cs=[[cx-dW/2,cy-dH/2],[cx+dW/2,cy-dH/2],[cx-dW/2,cy+dH/2],[cx+dW/2,cy+dH/2]];
+    if(cs.every(([x,y])=>Math.sqrt(x*x+y*y)<=R)) dies.push({cx,cy,w:dW,h:dH,r:Math.sqrt(cx*cx+cy*cy)});
+  }
+  return dies;
+}
+
+// ─── Monte Carlo ───────────────────────────────────────────────
+function mcSim(dies, wD, D0, eE, nT=200) {
+  const R=wD/2-eE, wA=Math.PI*(R/10)*(R/10), mD=D0*wA;
+  const yPT=[], dPC=new Array(dies.length).fill(0);
+  for(let t=0;t<nT;t++) {
+    const nDef=pRand(mD), defs=[];
+    for(let d=0;d<nDef;d++){let dx,dy;do{dx=(Math.random()*2-1)*R;dy=(Math.random()*2-1)*R;}while(dx*dx+dy*dy>R*R);defs.push([dx,dy]);}
+    let good=0;
+    for(let i=0;i<dies.length;i++){const die=dies[i];if(!defs.some(([dx,dy])=>dx>=die.cx-die.w/2&&dx<=die.cx+die.w/2&&dy>=die.cy-die.h/2&&dy<=die.cy+die.h/2)){good++;dPC[i]++;}}
+    yPT.push(good/dies.length);
+  }
+  const mean=yPT.reduce((a,b)=>a+b,0)/nT;
+  const std=Math.sqrt(yPT.reduce((a,b)=>a+(b-mean)**2,0)/(nT-1));
+  yPT.sort((a,b)=>a-b);
+  return{meanYield:mean,stdYield:std,dieProb:dPC.map(c=>c/nT),yieldPerTrial:yPT,p5:yPT[Math.floor(nT*.05)],p50:yPT[Math.floor(nT*.5)],p95:yPT[Math.floor(nT*.95)]};
+}
+function pRand(lam){if(lam<30){let L=Math.exp(-lam),k=0,p=1;do{k++;p*=Math.random();}while(p>L);return k-1;}const u1=Math.random(),u2=Math.random();return Math.max(0,Math.round(lam+Math.sqrt(lam)*Math.sqrt(-2*Math.log(u1))*Math.cos(2*Math.PI*u2)));}
+
+// ─── UI Helpers ────────────────────────────────────────────────
+const F="'JetBrains Mono',monospace";
+const P={background:"rgba(255,255,255,0.02)",border:"1px solid rgba(255,255,255,0.06)",borderRadius:12,padding:16,marginBottom:16};
+const SL=t=><div style={{fontSize:11,color:"#818CF8",fontFamily:F,textTransform:"uppercase",letterSpacing:1,marginBottom:10}}>{t}</div>;
+
+function Slider({label,value,onChange,min,max,step,unit="",display}){
+  return <div style={{marginBottom:14}}>
+    <div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}>
+      <span style={{fontSize:12,color:"#94a3b8",fontFamily:F,letterSpacing:.5}}>{label}</span>
+      <span style={{fontSize:13,color:"#e2e8f0",fontFamily:F,fontWeight:600}}>{display||value}{unit}</span>
+    </div>
+    <input type="range" min={min} max={max} step={step} value={value} onChange={e=>onChange(parseFloat(e.target.value))}/>
+  </div>;
+}
+
+function StatCard({label,value,sub,accent="#818CF8"}){
+  return <div style={{background:"rgba(255,255,255,0.03)",border:"1px solid rgba(255,255,255,0.06)",borderRadius:10,padding:"14px 16px",flex:1,minWidth:110}}>
+    <div style={{fontSize:11,color:"#64748b",fontFamily:F,textTransform:"uppercase",letterSpacing:1,marginBottom:6}}>{label}</div>
+    <div style={{fontSize:22,color:accent,fontWeight:700,fontFamily:F}}>{value}</div>
+    {sub&&<div style={{fontSize:11,color:"#475569",marginTop:3}}>{sub}</div>}
+  </div>;
+}
+
+// ─── Wafer Map ─────────────────────────────────────────────────
+function WaferMap({dies,waferDiamMm,edgeExclMm,dieProb}){
+  const sz=380,R=waferDiamMm/2,sc=(sz-30)/waferDiamMm,cx=sz/2,cy=sz/2;
+  function yc(p){
+    const stops=[{t:0,r:180,g:10,b:20},{t:.3,r:255,g:80,b:0},{t:.5,r:255,g:220,b:30},{t:.75,r:0,g:230,b:200},{t:1,r:50,g:255,b:100}];
+    p=Math.max(0,Math.min(1,p));let lo=stops[0],hi=stops[4];
+    for(let i=0;i<4;i++){if(p>=stops[i].t&&p<=stops[i+1].t){lo=stops[i];hi=stops[i+1];break;}}
+    const f=hi.t===lo.t?0:(p-lo.t)/(hi.t-lo.t);
+    return`rgb(${Math.round(lo.r+(hi.r-lo.r)*f)},${Math.round(lo.g+(hi.g-lo.g)*f)},${Math.round(lo.b+(hi.b-lo.b)*f)})`;
+  }
+  return <svg width={sz} height={sz} viewBox={`0 0 ${sz} ${sz}`} style={{display:"block",margin:"0 auto"}}>
+    <defs><radialGradient id="wg" cx="40%" cy="35%"><stop offset="0%" stopColor="#1e293b"/><stop offset="100%" stopColor="#0f172a"/></radialGradient></defs>
+    <circle cx={cx} cy={cy} r={R*sc} fill="url(#wg)" stroke="#334155" strokeWidth={1.5}/>
+    <circle cx={cx} cy={cy} r={(R-edgeExclMm)*sc} fill="none" stroke="#475569" strokeWidth={.5} strokeDasharray="3,3"/>
+    <line x1={cx} y1={cy+R*sc-4} x2={cx} y2={cy+R*sc+2} stroke="#475569" strokeWidth={2}/>
+    {dies.map((d,i)=>{const p=dieProb?dieProb[i]:null;return<rect key={i} x={cx+(d.cx-d.w/2)*sc} y={cy+(d.cy-d.h/2)*sc} width={d.w*sc-.6} height={d.h*sc-.6} rx={1} fill={p!==null?yc(p):"#3b4560"} opacity={.92} stroke="rgba(0,0,0,.5)" strokeWidth={.3}/>})}
+    <text x={cx} y={14} textAnchor="middle" fill="#64748b" fontSize={10} fontFamily={F}>{waferDiamMm}mm — {dies.length} gross die</text>
+  </svg>;
+}
+
+function Histogram({trials}){
+  if(!trials||!trials.length)return null;
+  const nB=25,mn=Math.min(...trials),mx=Math.max(...trials),rng=mx-mn||.01,bW=rng/nB;
+  const bins=new Array(nB).fill(0);trials.forEach(y=>{bins[Math.min(Math.floor((y-mn)/bW),nB-1)]++;});
+  const mB=Math.max(...bins),w=340,h=110,pd=30,barW=(w-2*pd)/nB;
+  return <svg width={w} height={h+20} viewBox={`0 0 ${w} ${h+20}`} style={{display:"block",margin:"10px auto 0"}}>
+    {bins.map((c,i)=><rect key={i} x={pd+i*barW} y={h-(mB>0?(c/mB)*(h-pd):0)} width={barW-1} height={mB>0?(c/mB)*(h-pd):0} rx={1} fill="#818CF8" opacity={.7}/>)}
+    <text x={pd} y={h+14} fill="#64748b" fontSize={9} fontFamily={F}>{(mn*100).toFixed(1)}%</text>
+    <text x={w-pd} y={h+14} fill="#64748b" fontSize={9} fontFamily={F} textAnchor="end">{(mx*100).toFixed(1)}%</text>
+    <text x={w/2} y={h+14} fill="#64748b" fontSize={9} fontFamily={F} textAnchor="middle">MC Yield Distribution</text>
+  </svg>;
+}
+
+// ─── Comparison Table ──────────────────────────────────────────
+function CompTable({dA,sMat,dW,dH,wD,eE}){
+  const mF=MATURITY_LEVELS[sMat].factor,gD=computeDies(wD,dW,dH,eE).length;
+  return <div style={{overflowX:"auto"}}>
+    <table style={{fontSize:12,fontFamily:F}}>
+      <thead><tr style={{borderBottom:"1px solid rgba(255,255,255,.1)"}}>
+        {["Node","Src","D₀","Murphy","Poisson","Seeds","NegBin","Good Die"].map(h=><th key={h} style={{padding:"10px 6px",textAlign:"right",color:"#94a3b8",fontWeight:500,fontSize:10,textTransform:"uppercase",letterSpacing:.5}}>{h}</th>)}
+      </tr></thead>
+      <tbody>{Object.entries(TSMC_NODES).map(([k,n])=>{
+        const d=n.d0_mature+(n.d0_ramp-n.d0_mature)*mF,mY=murphyYield(dA,d);
+        return <tr key={k} style={{borderBottom:"1px solid rgba(255,255,255,.04)"}}>
+          <td style={{padding:"8px 6px",color:n.color,fontWeight:600,textAlign:"right"}}>{n.label}</td>
+          <td style={{padding:"8px 6px",color:n.src==="★"?"#22c55e":"#64748b",textAlign:"right",fontSize:11}}>{n.src}</td>
+          <td style={{padding:"8px 6px",color:"#e2e8f0",textAlign:"right"}}>{d.toFixed(3)}</td>
+          <td style={{padding:"8px 6px",color:"#22c55e",textAlign:"right",fontWeight:600}}>{(mY*100).toFixed(1)}%</td>
+          <td style={{padding:"8px 6px",color:"#94a3b8",textAlign:"right"}}>{(poissonYield(dA,d)*100).toFixed(1)}%</td>
+          <td style={{padding:"8px 6px",color:"#94a3b8",textAlign:"right"}}>{(seedsYield(dA,d)*100).toFixed(1)}%</td>
+          <td style={{padding:"8px 6px",color:"#94a3b8",textAlign:"right"}}>{(negBinYield(dA,d)*100).toFixed(1)}%</td>
+          <td style={{padding:"8px 6px",color:"#e2e8f0",textAlign:"right",fontWeight:600}}>{Math.round(gD*mY)}</td>
+        </tr>;
+      })}</tbody>
+    </table>
+    <div style={{fontSize:9,color:"#475569",fontFamily:F,marginTop:8}}>★ = published TSMC data · Est = estimated/interpolated</div>
+  </div>;
+}
+
+// ─── Yield vs D0 Chart ─────────────────────────────────────────
+function YieldChart({dA,curD0}){
+  const w=380,h=200,pd=45,d0V=[];for(let d=.01;d<=.6;d+=.005)d0V.push(d);
+  const ms=[{fn:murphyYield,c:"#818CF8",l:"Murphy"},{fn:poissonYield,c:"#ef4444",l:"Poisson"},{fn:seedsYield,c:"#22c55e",l:"Seeds"},{fn:(a,d)=>negBinYield(a,d,2),c:"#f59e0b",l:"NegBin"}];
+  const xS=d=>pd+(d-.01)/.59*(w-2*pd),yS=y=>pd+(1-y)*(h-2*pd);
+  return <svg width={w} height={h+30} viewBox={`0 0 ${w} ${h+30}`} style={{display:"block",margin:"0 auto"}}>
+    {[0,.25,.5,.75,1].map(y=><g key={y}><line x1={pd} y1={yS(y)} x2={w-pd} y2={yS(y)} stroke="rgba(255,255,255,.06)" strokeWidth={.5}/><text x={pd-5} y={yS(y)+3} textAnchor="end" fill="#64748b" fontSize={9} fontFamily={F}>{(y*100).toFixed(0)}%</text></g>)}
+    {[.1,.2,.3,.4,.5].map(d=><g key={d}><line x1={xS(d)} y1={pd} x2={xS(d)} y2={h-pd} stroke="rgba(255,255,255,.04)" strokeWidth={.5}/><text x={xS(d)} y={h-pd+14} textAnchor="middle" fill="#64748b" fontSize={9} fontFamily={F}>{d.toFixed(1)}</text></g>)}
+    {ms.map(({fn,c,l})=><path key={l} d={d0V.map((d,i)=>`${i===0?'M':'L'}${xS(d)},${yS(fn(dA,d))}`).join(' ')} fill="none" stroke={c} strokeWidth={1.8} opacity={.8}/>)}
+    {curD0>.01&&curD0<.6&&<line x1={xS(curD0)} y1={pd} x2={xS(curD0)} y2={h-pd} stroke="#fff" strokeWidth={1} strokeDasharray="4,3" opacity={.5}/>}
+    {ms.map(({c,l},i)=><g key={l}><line x1={pd+i*85} y1={h+18} x2={pd+i*85+14} y2={h+18} stroke={c} strokeWidth={2}/><text x={pd+i*85+18} y={h+21} fill="#94a3b8" fontSize={9} fontFamily={F}>{l}</text></g>)}
+    <text x={w/2} y={h-pd+28} textAnchor="middle" fill="#64748b" fontSize={10} fontFamily={F}>D₀ (defects/cm²)</text>
+  </svg>;
+}
+
+// ─── References ────────────────────────────────────────────────
+const REFS = {
+  "TSMC Official & Symposia": [
+    ["TSMC N7/N6 Platform Technology", "https://www.tsmc.com/english/dedicatedFoundry/technology/platform_DCE_N7_N6"],
+    ["TSMC 16/12nm Technology", "https://www.tsmc.com/english/dedicatedFoundry/technology/logic/l_16_12nm"],
+    ["TSMC 2023 Annual Report Ch.5", "https://investor.tsmc.com/static/annualReports/2023/english/pdf/2023_tsmc_ar_e_ch5.pdf"],
+    ["Scaling to Meet the AI Era — TSPA Semiconductor", "https://tspasemiconductor.substack.com/p/scaling-to-meet-the-ai-era-tsmcs"],
+  ],
+  "Defect Density (D₀) Data": [
+    ["TSMC 7nm/5nm Yield & Packaging — WikiChip Fuse", "https://fuse.wikichip.org/news/2567/tsmc-talks-7nm-5nm-yield-and-next-gen-5g-and-hpc-packaging/"],
+    ["'Better Yield on 5nm than 7nm' — AnandTech", "https://www.anandtech.com/show/16028/better-yield-on-5nm-than-7nm-tsmc-update-on-defect-rates-for-n5"],
+    ["TSMC N2 Defect Density < N3 — Tom's Hardware", "https://www.tomshardware.com/tech-industry/tsmc-discloses-n2-defect-density-lower-than-n3-at-the-same-stage-of-development"],
+    ["TSMC N2 D₀ Discussion — SemiWiki", "https://semiwiki.com/forum/threads/tsmc-discloses-n2-defect-density-lower-than-n3-at-the-same-stage-of-development.22699/"],
+    ["TSM D₀ Trend & 5nm Projection — SemiWiki", "https://semiwiki.com/forum/threads/tsm-defect-density-trend-and-projection-for-5nm.12942/"],
+    ["Intel 18A D₀ (TSMC comparisons) — Tom's Hardware", "https://www.tomshardware.com/tech-industry/intel-says-defect-density-at-18a-is-healthy-potential-clients-are-lining-up"],
+    ["D₀ in TSMC × NVIDIA — TSPA Semiconductor", "https://tspasemiconductor.substack.com/p/behind-the-yield-exploring-d-challenges"],
+    ["TSMC N2 Matching 5nm — TweakTown", "https://www.tweaktown.com/news/105016/tsmcs-new-2nm-node-progressing-smoothly-matching-5nm-surpassing-3nm-7nm-at-similar-stages/index.html"],
+    ["TSMC 2nm Defect Rate Record Low — SMBOM", "https://www.smbom.com/news/38080"],
+  ],
+  "Yield Models & Theory": [
+    ["How Foundries Calculate Die Yield — Vik's Newsletter", "https://www.viksnewsletter.com/p/how-foundries-calculate-die-yield"],
+    ["Yield Modeling — Prof. Leachman, UC Berkeley (PDF)", "https://fog.misty.com/perry/cod/references/yield_models.pdf"],
+    ["Test Yield Models — EESemi", "https://www.eesemi.com/test-yield-models.htm"],
+    ["Yield Enhancement — ITRS (PDF)", "https://www.semiconductors.org/wp-content/uploads/2018/09/Yield.pdf"],
+    ["5nm Process — Wikipedia", "https://en.wikipedia.org/wiki/5_nm_process"],
+  ],
+  "SRAM Redundancy & Memory Yield": [
+    ["SRAM Redundancy Repair Verification — SemiEngineering", "https://semiengineering.com/using-symbolic-simulation-for-sram-redundancy-repair-verification/"],
+    ["SRAM Redundancy with Calibre CAA — Siemens/Mentor", "https://blogs.sw.siemens.com/calibre/2017/03/20/are-you-wasting-your-sram-memory-redundancy/"],
+    ["Yield of Repairable SRAMs (Markov) — ResearchGate", "https://www.researchgate.net/publication/3091546_Evaluating_the_yield_of_repairable_SRAMs_for_ATE"],
+    ["Repair with Spare Rows/Columns — SpringerLink", "https://link.springer.com/chapter/10.1007/978-3-540-30585-9_79"],
+  ],
+  "Online Yield Calculators": [
+    ["Die Yield Calculator (Murphy) — iSine", "https://isine.com/resources/die-yield-calculator/"],
+    ["DPW Calculator — dpwcalculator.com", "https://www.dpwcalculator.com/"],
+    ["GDPW Calculator — Silicon Analysts", "https://siliconanalysts.com/tools/calculator"],
+  ],
+};
+
+// ─── Main App ──────────────────────────────────────────────────
+function App() {
+  const [dieArea, setDieArea] = useState(60);
+  const [dieAspect, setDieAspect] = useState(1.2);
+  const [edgeExcl, setEdgeExcl] = useState(3);
+  const [selectedNode, setSelectedNode] = useState("N7");
+  const [maturity, setMaturity] = useState("mature");
+  const [customD0, setCustomD0] = useState(null);
+  const [mcResults, setMcResults] = useState(null);
+  const [mcTrials, setMcTrials] = useState(300);
+  const [tab, setTab] = useState("calc");
+  const [sramPct, setSramPct] = useState(0);
+  const [sramRows, setSramRows] = useState(256);
+  const [sramSpares, setSramSpares] = useState(4);
+
+  const wD=300, dW=Math.sqrt(dieArea*dieAspect), dH=dieArea/dW, dA=dieArea/100;
+  const node=TSMC_NODES[selectedNode], mF=MATURITY_LEVELS[maturity].factor;
+  const d0=customD0!==null?customD0:(node.d0_mature+(node.d0_ramp-node.d0_mature)*mF);
+  const dies=useMemo(()=>computeDies(wD,dW,dH,edgeExcl),[dW,dH,edgeExcl]);
+  const gD=dies.length;
+
+  const logA=dA*(1-sramPct/100), sA=dA*(sramPct/100);
+  const lY=murphyYield(logA,d0), sY=sramPct>0?sramRepairYield(sA,d0,sramRows,sramSpares):1;
+  const mY=sramPct>0?lY*sY:murphyYield(dA,d0);
+  const pY=poissonYield(dA,d0), seY=seedsYield(dA,d0), nbY=negBinYield(dA,d0);
+  const goodDie=Math.round(gD*mY);
+  const runMC=useCallback(()=>{setMcResults(mcSim(dies,wD,d0,edgeExcl,mcTrials));},[dies,d0,edgeExcl,mcTrials]);
+
+  const tS=t=>({padding:"10px 16px",cursor:"pointer",fontSize:11,fontFamily:F,fontWeight:tab===t?700:400,color:tab===t?"#818CF8":"#64748b",background:"none",border:"none",letterSpacing:.5,textTransform:"uppercase",borderBottom:tab===t?"2px solid #818CF8":"2px solid transparent"});
+
+  return <div style={{padding:"24px 16px"}}>
+    <div style={{maxWidth:940,margin:"0 auto",marginBottom:24}}>
+      <span style={{fontSize:11,color:"#818CF8",fontFamily:F,letterSpacing:2,textTransform:"uppercase"}}>SEMICONDUCTOR YIELD</span>
+      <h1 style={{fontSize:24,fontWeight:700,fontFamily:F,margin:"4px 0 0",color:"#f1f5f9",letterSpacing:-.5}}>Murphy Yield Calculator</h1>
+      <p style={{fontSize:12,color:"#64748b",margin:"4px 0 0",fontFamily:F}}>TSMC N16 → N2 · 300mm · Murphy / Poisson / Seeds / NegBin · SRAM redundancy · Monte Carlo</p>
+    </div>
+
+    <div style={{maxWidth:940,margin:"0 auto",display:"flex",borderBottom:"1px solid rgba(255,255,255,.08)",marginBottom:20}}>
+      {[["calc","Calculator"],["wafer","Wafer Map + MC"],["compare","Node Comparison"]].map(([k,l])=><button key={k} style={tS(k)} onClick={()=>setTab(k)}>{l}</button>)}
+    </div>
+
+    <div style={{maxWidth:940,margin:"0 auto"}}>
+
+      {/* ═══ CALCULATOR ═══ */}
+      {tab==="calc"&&<div style={{display:"grid",gridTemplateColumns:"320px 1fr",gap:20}}>
+        <div>
+          <div style={P}>{SL("Die Parameters")}
+            <Slider label="Die Area" value={dieArea} onChange={setDieArea} min={5} max={400} step={1} unit=" mm²"/>
+            <Slider label="Aspect Ratio" value={dieAspect} onChange={setDieAspect} min={.5} max={3} step={.1} display={dieAspect.toFixed(1)} unit={` (${dW.toFixed(1)}×${dH.toFixed(1)}mm)`}/>
+            <Slider label="Edge Exclusion" value={edgeExcl} onChange={setEdgeExcl} min={1} max={5} step={.5} unit=" mm"/>
+          </div>
+          <div style={P}>{SL("TSMC Node")}
+            <div style={{display:"flex",flexWrap:"wrap",gap:5,marginBottom:12}}>
+              {Object.entries(TSMC_NODES).map(([k,n])=><button key={k} onClick={()=>{setSelectedNode(k);setCustomD0(null);}} style={{padding:"5px 8px",borderRadius:5,fontSize:10,fontFamily:F,cursor:"pointer",border:selectedNode===k?`1px solid ${n.color}`:"1px solid rgba(255,255,255,.08)",background:selectedNode===k?`${n.color}15`:"transparent",color:selectedNode===k?n.color:"#94a3b8"}}>{k}</button>)}
+            </div>
+            {SL("Process Maturity")}
+            <div style={{display:"flex",flexWrap:"wrap",gap:5,marginBottom:12}}>
+              {Object.entries(MATURITY_LEVELS).map(([k,m])=><button key={k} onClick={()=>{setMaturity(k);setCustomD0(null);}} style={{padding:"5px 8px",borderRadius:5,fontSize:10,fontFamily:F,cursor:"pointer",border:maturity===k?"1px solid #818CF8":"1px solid rgba(255,255,255,.08)",background:maturity===k?"rgba(129,140,248,.1)":"transparent",color:maturity===k?"#818CF8":"#94a3b8"}}>{m.label}</button>)}
+            </div>
+            <Slider label="Custom D₀" value={customD0!==null?customD0:d0} onChange={v=>setCustomD0(v)} min={.01} max={.6} step={.005} unit=" def/cm²" display={(customD0!==null?customD0:d0).toFixed(3)}/>
+            {customD0!==null&&<button onClick={()=>setCustomD0(null)} style={{fontSize:10,color:"#818CF8",background:"none",border:"none",cursor:"pointer",fontFamily:F,padding:0,marginTop:-8}}>↩ Reset</button>}
+          </div>
+          <div style={P}>{SL("Embedded SRAM Redundancy")}
+            <Slider label="SRAM % of Die" value={sramPct} onChange={setSramPct} min={0} max={80} step={1} unit="%"/>
+            {sramPct>0&&<React.Fragment>
+              <Slider label="Row/Col Units" value={sramRows} onChange={v=>setSramRows(Math.round(v))} min={32} max={2048} step={32} display={sramRows}/>
+              <Slider label="Spare Rows/Cols" value={sramSpares} onChange={v=>setSramSpares(Math.round(v))} min={0} max={32} step={1} display={sramSpares}/>
+              <div style={{fontSize:10,color:"#475569",fontFamily:F,lineHeight:1.6,marginTop:4}}>
+                SRAM: {(sA*100).toFixed(1)} mm² · Logic: {(logA*100).toFixed(1)} mm²<br/>
+                Logic yield (Murphy): {(lY*100).toFixed(1)}% · SRAM yield (Bernoulli): {(sY*100).toFixed(1)}%
+              </div>
+            </React.Fragment>}
+          </div>
+        </div>
+        <div>
+          <div style={{display:"flex",flexWrap:"wrap",gap:10,marginBottom:16}}>
+            <StatCard label="Gross Die" value={gD} sub={`${dW.toFixed(1)}×${dH.toFixed(1)}mm`} accent="#60a5fa"/>
+            <StatCard label={sramPct>0?"Composite":"Murphy Yield"} value={`${(mY*100).toFixed(1)}%`} sub={`D₀=${d0.toFixed(3)} ${node.src}`} accent="#22c55e"/>
+            <StatCard label="Good Die" value={goodDie} sub="per wafer" accent="#818CF8"/>
+          </div>
+          <div style={P}>
+            <div style={{fontSize:11,color:"#64748b",fontFamily:F,textTransform:"uppercase",letterSpacing:1,marginBottom:8}}>Model Comparison — {node.label}{sramPct>0?" (logic only)":""}</div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:8}}>
+              {[{l:"Poisson",y:pY,c:"#ef4444",d:"Uniform"},{l:"Murphy",y:sramPct>0?lY:mY,c:"#818CF8",d:"Triangular"},{l:"Seeds",y:seY,c:"#22c55e",d:"Optimistic"},{l:"Neg.Bin",y:nbY,c:"#f59e0b",d:"Clustered"}].map(m=>
+                <div key={m.l} style={{textAlign:"center",padding:8}}>
+                  <div style={{fontSize:20,fontWeight:700,color:m.c,fontFamily:F}}>{(m.y*100).toFixed(1)}%</div>
+                  <div style={{fontSize:10,color:"#94a3b8",marginTop:2}}>{m.l}</div>
+                  <div style={{fontSize:9,color:"#475569",marginTop:1}}>{m.d}</div>
+                </div>)}
+            </div>
+          </div>
+          <div style={P}>
+            <div style={{fontSize:11,color:"#64748b",fontFamily:F,textTransform:"uppercase",letterSpacing:1,marginBottom:8}}>Yield vs D₀</div>
+            <YieldChart dA={dA} curD0={d0}/>
+          </div>
+        </div>
+      </div>}
+
+      {/* ═══ WAFER MAP + MC ═══ */}
+      {tab==="wafer"&&<div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:20}}>
+        <div>
+          <div style={P}>{SL("Monte Carlo Simulation")}
+            <p style={{fontSize:11,color:"#94a3b8",margin:"0 0 12px",lineHeight:1.6}}>Poisson-scatters D₀×Area defects uniformly per trial. Per-die pass/fail recorded.</p>
+            <Slider label="Trials" value={mcTrials} onChange={v=>setMcTrials(Math.round(v))} min={50} max={1000} step={50}/>
+            <div style={{display:"flex",gap:8,marginTop:4}}>
+              <div style={{flex:1,fontSize:11,color:"#94a3b8",fontFamily:F}}>Node: <span style={{color:node.color}}>{node.label}</span><br/>D₀: <span style={{color:"#e2e8f0"}}>{d0.toFixed(3)}</span><br/>Die: <span style={{color:"#e2e8f0"}}>{dieArea}</span> mm²</div>
+              <button onClick={runMC} style={{padding:"12px 24px",borderRadius:8,fontSize:13,fontWeight:600,fontFamily:F,cursor:"pointer",background:"linear-gradient(135deg,#818CF8,#6366f1)",border:"none",color:"#fff",alignSelf:"center"}}>▶ RUN</button>
+            </div>
+          </div>
+          {mcResults&&<div style={P}>
+            <div style={{fontSize:11,color:"#64748b",fontFamily:F,textTransform:"uppercase",letterSpacing:1,marginBottom:10}}>Results ({mcTrials} trials)</div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginBottom:10}}>
+              <StatCard label="Mean" value={`${(mcResults.meanYield*100).toFixed(1)}%`} accent="#22c55e"/>
+              <StatCard label="σ" value={`±${(mcResults.stdYield*100).toFixed(2)}%`} accent="#f59e0b"/>
+              <StatCard label="Good Die" value={Math.round(gD*mcResults.meanYield)} accent="#818CF8"/>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginBottom:8}}>
+              <StatCard label="P5" value={`${(mcResults.p5*100).toFixed(1)}%`} sub="worst 5%" accent="#ef4444"/>
+              <StatCard label="Median" value={`${(mcResults.p50*100).toFixed(1)}%`} accent="#60a5fa"/>
+              <StatCard label="P95" value={`${(mcResults.p95*100).toFixed(1)}%`} sub="best 5%" accent="#22c55e"/>
+            </div>
+            <div style={{fontSize:10,color:"#475569",fontFamily:F,marginTop:4}}>Murphy: {(murphyYield(dA,d0)*100).toFixed(1)}% — MC: {(mcResults.meanYield*100).toFixed(1)}% — Δ={((mcResults.meanYield-murphyYield(dA,d0))*100).toFixed(2)}%</div>
+            <Histogram trials={mcResults.yieldPerTrial}/>
+          </div>}
+        </div>
+        <div>
+          <div style={P}>
+            <div style={{marginBottom:10}}><div style={{fontSize:11,color:"#64748b",fontFamily:F,textTransform:"uppercase",letterSpacing:1}}>Wafer Map — Per-Die Yield Prob</div></div>
+            <WaferMap dies={dies} waferDiamMm={wD} edgeExclMm={edgeExcl} dieProb={mcResults?.dieProb}/>
+            {mcResults&&<div style={{display:"flex",justifyContent:"center",alignItems:"center",gap:8,marginTop:10}}>
+              <span style={{fontSize:9,color:"#64748b",fontFamily:F}}>0%</span>
+              <div style={{width:180,height:12,borderRadius:3,background:"linear-gradient(90deg,rgb(180,10,20),rgb(255,80,0),rgb(255,220,30),rgb(0,230,200),rgb(50,255,100))",border:"1px solid rgba(255,255,255,.1)"}}/>
+              <span style={{fontSize:9,color:"#64748b",fontFamily:F}}>100%</span>
+            </div>}
+            {!mcResults&&<p style={{textAlign:"center",fontSize:11,color:"#475569",marginTop:8,fontFamily:F}}>Run Monte Carlo to see per-die yield probability</p>}
+          </div>
+        </div>
+      </div>}
+
+      {/* ═══ NODE COMPARISON ═══ */}
+      {tab==="compare"&&<div>
+        <div style={P}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14,flexWrap:"wrap",gap:8}}>
+            <div style={{fontSize:11,color:"#818CF8",fontFamily:F,textTransform:"uppercase",letterSpacing:1}}>All Nodes — {dieArea} mm² — {MATURITY_LEVELS[maturity].label}</div>
+            <div style={{display:"flex",gap:5}}>{Object.entries(MATURITY_LEVELS).map(([k,m])=><button key={k} onClick={()=>setMaturity(k)} style={{padding:"4px 8px",borderRadius:5,fontSize:10,fontFamily:F,cursor:"pointer",border:maturity===k?"1px solid #818CF8":"1px solid rgba(255,255,255,.08)",background:maturity===k?"rgba(129,140,248,.1)":"transparent",color:maturity===k?"#818CF8":"#64748b"}}>{m.label}</button>)}</div>
+          </div>
+          <CompTable dA={dA} sMat={maturity} dW={dW} dH={dH} wD={wD} eE={edgeExcl}/>
+        </div>
+        <div style={P}>
+          <div style={{fontSize:11,color:"#64748b",fontFamily:F,textTransform:"uppercase",letterSpacing:1,marginBottom:14}}>Murphy Yield by Node</div>
+          <div style={{display:"flex",alignItems:"flex-end",gap:4,height:160,padding:"0 10px",overflowX:"auto"}}>
+            {Object.entries(TSMC_NODES).map(([k,n])=>{const dd=n.d0_mature+(n.d0_ramp-n.d0_mature)*mF;const y=murphyYield(dA,dd);
+              return <div key={k} style={{flex:1,minWidth:32,display:"flex",flexDirection:"column",alignItems:"center",gap:3}}>
+                <span style={{fontSize:8,fontWeight:700,color:n.color,fontFamily:F}}>{(y*100).toFixed(0)}%</span>
+                <div style={{width:"100%",maxWidth:42,height:`${y*130}px`,background:`linear-gradient(180deg,${n.color},${n.color}66)`,borderRadius:"5px 5px 2px 2px",transition:"height .3s"}}/>
+                <span style={{fontSize:7,color:"#94a3b8",fontFamily:F}}>{k}</span>
+              </div>;})}
+          </div>
+        </div>
+        <div style={P}>
+          <div style={{fontSize:11,color:"#64748b",fontFamily:F,textTransform:"uppercase",letterSpacing:1,marginBottom:14}}>Murphy Yield vs Die Area (Mature D₀)</div>
+          <svg width="100%" viewBox="0 0 800 220" style={{display:"block"}}>
+            {[0,25,50,75,100].map(y=><g key={y}><line x1={60} y1={190-y*1.7} x2={760} y2={190-y*1.7} stroke="rgba(255,255,255,.05)" strokeWidth={.5}/><text x={55} y={193-y*1.7} textAnchor="end" fill="#64748b" fontSize={9} fontFamily={F}>{y}%</text></g>)}
+            {[50,100,150,200,250,300,350,400].map(a=><text key={a} x={60+(a-10)/390*700} y={207} textAnchor="middle" fill="#64748b" fontSize={9} fontFamily={F}>{a}</text>)}
+            <text x={410} y={220} textAnchor="middle" fill="#475569" fontSize={10} fontFamily={F}>Die Area (mm²)</text>
+            {Object.entries(TSMC_NODES).map(([k,n])=>{const pts=[];for(let a=10;a<=400;a+=5){const y=murphyYield(a/100,n.d0_mature);pts.push(`${pts.length===0?'M':'L'}${60+(a-10)/390*700},${190-y*100*1.7}`);}return <path key={k} d={pts.join(' ')} fill="none" stroke={n.color} strokeWidth={1.5} opacity={.7}/>;})}
+            <line x1={60+(dieArea-10)/390*700} y1={20} x2={60+(dieArea-10)/390*700} y2={190} stroke="#fff" strokeWidth={1} strokeDasharray="4,3" opacity={.3}/>
+          </svg>
+        </div>
+      </div>}
+
+      {/* ═══ REFERENCES ═══ */}
+      <div style={{marginTop:32,paddingTop:16,borderTop:"1px solid rgba(255,255,255,.06)",fontFamily:F}}>
+        <div style={{fontSize:10,color:"#334155",lineHeight:1.8,marginBottom:20}}>
+          <strong style={{color:"#475569"}}>Notes:</strong> ★ D₀ from published TSMC data: N7 & N5 ~0.33 at 3Q pre-HVM; N5 entered HVM at ~0.1, matured to ~0.06; N7 ~0.09 at 3Q post-HVM; N3 higher than N5 at MP, matched within 5–6Q; N2 tracking below N3 at same stage.
+          Est = interpolated. Murphy: Y = [(1-e^(-AD₀))/(AD₀)]². SRAM: Bernoulli trials on row/col units with spare replacement.
+          MC: uniform Poisson — real wafers show edge effects and clustering.
+        </div>
+        {Object.entries(REFS).map(([cat,refs])=><div key={cat} style={{marginBottom:16}}>
+          <div style={{fontSize:10,color:"#818CF8",textTransform:"uppercase",letterSpacing:1,marginBottom:6}}>{cat}</div>
+          <div style={{display:"flex",flexDirection:"column",gap:4}}>
+            {refs.map(([t,u])=><a key={u} href={u} target="_blank" rel="noopener noreferrer" style={{color:"#64748b",textDecoration:"none",fontSize:10,lineHeight:1.5}} onMouseOver={e=>e.target.style.color="#818CF8"} onMouseOut={e=>e.target.style.color="#64748b"}>→ {t}</a>)}
+          </div>
+        </div>)}
+      </div>
+    </div>
+  </div>;
+}
+
+ReactDOM.render(<App/>, document.getElementById('root'));
+</script>
+</body>
+</html>
